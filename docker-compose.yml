@@ -1,0 +1,177 @@
+# Local stack: Kafka + Iceberg REST (MinIO) + Flink SQL VARIANT pipeline
+#
+# Usage:
+#   docker compose up -d --build
+#   ./scripts/pipeline.sh run
+services:
+  broker:
+    image: apache/kafka:3.7.2
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    networks:
+      iceberg_net:
+    hostname: broker
+    container_name: broker
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://broker:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_NODE_ID: 1
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@broker:29093
+      KAFKA_LISTENERS: PLAINTEXT://broker:9092,CONTROLLER://broker:29093,PLAINTEXT_HOST://0.0.0.0:29092
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LOG_DIRS: /tmp/kraft-combined-logs
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+      KAFKA_JMX_PORT: 9997
+
+  kafka-ui:
+    container_name: kafka-ui
+    image: provectuslabs/kafka-ui:latest
+    networks:
+      - iceberg_net
+    ports:
+      - "9080:8080"   # host 9080 (8080 is often taken locally)
+    depends_on:
+      - broker
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: broker:9092
+      KAFKA_CLUSTERS_0_METRICS_PORT: 9997
+      DYNAMIC_CONFIG_ENABLED: "true"
+
+  minio:
+    image: minio/minio
+    hostname: minio
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # Web console
+    environment:
+      MINIO_ROOT_USER: admin
+      MINIO_ROOT_PASSWORD: password
+      MINIO_DOMAIN: minio
+    networks:
+      iceberg_net:
+        aliases:
+          - warehouse.minio
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  create-bucket:
+    image: minio/mc
+    depends_on:
+      minio:
+        condition: service_healthy
+    networks:
+      iceberg_net:
+    entrypoint: |
+      /bin/sh -c "
+      until (/usr/bin/mc alias set minio http://minio:9000 admin password) do echo '...waiting...' && sleep 1; done;
+      /usr/bin/mc rm -r --force minio/warehouse || true;
+      /usr/bin/mc mb minio/warehouse;
+      /usr/bin/mc policy set public minio/warehouse;
+      "
+
+
+
+
+
+
+  iceberg-rest:
+    image: apache/iceberg-rest-fixture
+    hostname: iceberg-rest
+    depends_on:
+      create-bucket:
+        condition: service_completed_successfully
+    networks:
+      iceberg_net:
+    ports:
+      - "8181:8181"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8181/v1/config"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    environment:
+      AWS_REGION: us-east-1
+      CATALOG_WAREHOUSE: s3://warehouse/
+      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
+      CATALOG_S3_ENDPOINT: http://minio:9000
+      CATALOG_S3_ACCESS__KEY__ID: admin
+      CATALOG_S3_SECRET__ACCESS__KEY: password
+
+  jobmanager:
+    build: .
+    hostname: jobmanager
+    container_name: jobmanager
+    depends_on:
+      broker:
+        condition: service_started
+      iceberg-rest:
+        condition: service_healthy
+    networks:
+      iceberg_net:
+    command: jobmanager
+    ports:
+      - "8081:8081"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/overview"]
+      start_period: 30s
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: jobmanager
+        taskmanager.numberOfTaskSlots: 4
+        parallelism.default: 2
+        execution.checkpointing.interval: 10s
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: admin
+      AWS_SECRET_ACCESS_KEY: password
+      S3_ENDPOINT: http://minio:9000
+
+  taskmanager:
+    build: .
+    hostname: taskmanager
+    depends_on:
+      jobmanager:
+        condition: service_healthy
+    networks:
+      iceberg_net:
+    command: taskmanager
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: jobmanager
+        taskmanager.numberOfTaskSlots: 4
+        parallelism.default: 2
+        execution.checkpointing.interval: 10s
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: admin
+      AWS_SECRET_ACCESS_KEY: password
+      S3_ENDPOINT: http://minio:9000
+
+  python:
+    image: python:3.11-slim
+    container_name: python
+    networks:
+      - iceberg_net
+    depends_on:
+      - broker
+    command: /bin/bash -c "pip install -r /workspace/requirements.txt && tail -f /dev/null"
+    volumes:
+      - ./:/workspace
+    tty: true
+
+networks:
+  iceberg_net:

@@ -1,0 +1,21 @@
+
+
+docker compose up -d --build
+chmod +x scripts/pipeline.sh
+
+# one-shot
+./scripts/pipeline.sh run
+
+# or step by step
+./scripts/pipeline.sh register
+./scripts/pipeline.sh start
+docker exec python python /workspace/producer.py
+
+# pause / resume
+./scripts/pipeline.sh pause
+./scripts/pipeline.sh start --keep
+
+# full stop
+./scripts/pipeline.sh stop
+
+python simple_fanout_test.py
